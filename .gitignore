@@ -1,0 +1,7 @@
+node_modules/
+.env
+.DS_Store
+Thumbs.db
+
+# Large digit datasets should be mounted or uploaded separately.
+data/
