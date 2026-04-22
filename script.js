@@ -9,7 +9,118 @@ const constantName = document.querySelector("#constantName");
 const estimateText = document.querySelector("#estimateText");
 const result = document.querySelector("#result");
 
-let constants = new Map();
+const constants = {
+  pi: { label: "\u03c0", fullName: "\u5706\u5468\u7387 \u03c0", estimateBase: 0.7 },
+  e: { label: "e", fullName: "\u81ea\u7136\u5e38\u6570 e", estimateBase: 1.0 },
+  sqrt2: { label: "\u221a2", fullName: "\u221a2", estimateBase: 0.2 },
+  phi: { label: "\u03c6", fullName: "\u9ec4\u91d1\u6bd4\u4f8b \u03c6", estimateBase: 0.25 }
+};
+
+const cache = new Map();
+const runtimeSamples = new Map();
+let activeKey = "pi";
+let pendingQuery = "";
+let pendingLimit = 0;
+let startedAt = 0;
+let elapsedTimer = null;
+let worker = null;
+
+const workerSource = `
+  function pow10(exp) {
+    return 10n ** BigInt(exp);
+  }
+
+  function arctanInverse(inverseX, scale) {
+    const x = BigInt(inverseX);
+    const xSquared = x * x;
+    let term = scale / x;
+    let sum = term;
+    let denominator = 1n;
+    let subtract = true;
+
+    while (term !== 0n) {
+      term /= xSquared;
+      denominator += 2n;
+      const fraction = term / denominator;
+      if (fraction === 0n) break;
+      sum = subtract ? sum - fraction : sum + fraction;
+      subtract = !subtract;
+    }
+
+    return sum;
+  }
+
+  function integerSqrt(value) {
+    if (value < 2n) return value;
+    let x0 = value;
+    let x1 = (x0 + value / x0) >> 1n;
+    while (x1 < x0) {
+      x0 = x1;
+      x1 = (x0 + value / x0) >> 1n;
+    }
+    return x0;
+  }
+
+  function computePi(decimals, guardDigits) {
+    const scale = pow10(decimals + guardDigits);
+    return 16n * arctanInverse(5, scale) - 4n * arctanInverse(239, scale);
+  }
+
+  function computeE(decimals, guardDigits) {
+    const scale = pow10(decimals + guardDigits);
+    let sum = scale;
+    let term = scale;
+    let denominator = 1n;
+
+    while (term > 0n) {
+      term /= denominator;
+      sum += term;
+      denominator += 1n;
+    }
+
+    return sum;
+  }
+
+  function computeSqrt(value, decimals, guardDigits) {
+    const scale = pow10(decimals + guardDigits);
+    return integerSqrt(BigInt(value) * scale * scale);
+  }
+
+  function computePhi(decimals, guardDigits) {
+    const scale = pow10(decimals + guardDigits);
+    const sqrt5 = integerSqrt(5n * scale * scale);
+    return (sqrt5 + scale) / 2n;
+  }
+
+  self.onmessage = (event) => {
+    const key = event.data.key;
+    const decimals = Number(event.data.decimals);
+    const guardDigits = 12;
+
+    self.postMessage({ type: "status", message: "Calculating..." });
+
+    let scaled;
+    if (key === "pi") scaled = computePi(decimals, guardDigits);
+    if (key === "e") scaled = computeE(decimals, guardDigits);
+    if (key === "sqrt2") scaled = computeSqrt(2, decimals, guardDigits);
+    if (key === "phi") scaled = computePhi(decimals, guardDigits);
+
+    const trimmed = scaled / pow10(guardDigits);
+    const raw = trimmed.toString().padStart(decimals + 1, "0");
+
+    self.postMessage({
+      type: "done",
+      key,
+      decimals,
+      digits: raw.slice(1, decimals + 1)
+    });
+  };
+`;
+
+function createWorker() {
+  const blob = new Blob([workerSource], { type: "text/javascript" });
+  return new Worker(URL.createObjectURL(blob));
+}
 
 function setBusy(isBusy) {
   searchButton.disabled = isBusy;
@@ -45,11 +156,15 @@ function escapeHtml(value) {
 function renderResult(type, title, message, contextHtml = "") {
   result.className = `result ${type}`;
   result.innerHTML = `
-    <span class="result-kicker">结果</span>
+    <span class="result-kicker">\u7ed3\u679c</span>
     <h2>${title}</h2>
     <p>${message}</p>
     ${contextHtml}
   `;
+}
+
+function getActiveRecord() {
+  return cache.get(activeKey) || { digits: "", decimals: 0 };
 }
 
 function probabilityForRange(queryLength, decimals) {
@@ -66,140 +181,158 @@ function probabilityNote(query, decimals) {
     ? "<0.1%"
     : `${(probability * 100).toFixed(probability < 0.01 ? 2 : 1)}%`;
 
-  return `你输入的是 ${query.length} 位数字串。若把小数展开看作随机数字流，它平均约 ${formatNumber(expected)} 位出现一次；当前搜索范围的理论命中概率约为 ${percent}。`;
+  return `\u4f60\u8f93\u5165\u7684\u662f ${query.length} \u4f4d\u6570\u5b57\u4e32\u3002\u82e5\u628a\u5c0f\u6570\u5c55\u5f00\u770b\u4f5c\u968f\u673a\u6570\u5b57\u6d41\uff0c\u5b83\u5e73\u5747\u7ea6 ${formatNumber(expected)} \u4f4d\u51fa\u73b0\u4e00\u6b21\uff1b\u5f53\u524d\u641c\u7d22\u8303\u56f4\u7684\u7406\u8bba\u547d\u4e2d\u6982\u7387\u7ea6\u4e3a ${percent}\u3002`;
 }
 
-function makeContextHtml(context) {
-  if (!context) return "";
+function estimateSeconds(key, decimals) {
+  const exact = runtimeSamples.get(`${key}:${decimals}`);
+  if (exact) return exact;
 
-  const prefix = context.hasBefore ? "..." : "";
-  const suffix = context.hasAfter ? "..." : "";
+  const scale = decimals / 50000;
+  const exponent = key === "e" ? 1.85 : key === "pi" ? 1.72 : 1.32;
+  return constants[key].estimateBase * Math.pow(scale, exponent);
+}
+
+function updateEstimate() {
+  const seconds = estimateSeconds(constantSelect.value, Number(precisionSelect.value));
+  estimateText.textContent = formatSeconds(seconds);
+}
+
+function updateStatus(message = "Ready") {
+  const record = getActiveRecord();
+  statusText.textContent = message;
+  digitCount.textContent = `${formatNumber(record.decimals)} \u4f4d`;
+  constantName.textContent = constants[activeKey].label;
+  updateEstimate();
+}
+
+function startElapsedTimer() {
+  stopElapsedTimer();
+  elapsedTimer = setInterval(() => {
+    const seconds = (performance.now() - startedAt) / 1000;
+    statusText.textContent = `Working ${formatSeconds(seconds).replace("~", "")}`;
+  }, 500);
+}
+
+function stopElapsedTimer() {
+  if (elapsedTimer) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+}
+
+function makeContextHtml(digits, index, query) {
+  const radius = 34;
+  const start = Math.max(0, index - radius);
+  const end = Math.min(digits.length, index + query.length + radius);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < digits.length ? "..." : "";
+  const before = escapeHtml(digits.slice(start, index));
+  const match = escapeHtml(digits.slice(index, index + query.length));
+  const after = escapeHtml(digits.slice(index + query.length, end));
+
   return `
-    <div class="context" aria-label="小数上下文">
-      ${prefix}${escapeHtml(context.before)}<mark>${escapeHtml(context.match)}</mark>${escapeHtml(context.after)}${suffix}
+    <div class="context" aria-label="\u5c0f\u6570\u4e0a\u4e0b\u6587">
+      0.${prefix}${before}<mark>${match}</mark>${after}${suffix}
     </div>
   `;
 }
 
-function updateEstimate() {
-  const info = constants.get(constantSelect.value);
-  const limit = Number(precisionSelect.value);
+function searchDigits(key, query, limit) {
+  const meta = constants[key];
+  const record = cache.get(key);
+  const digits = record.digits.slice(0, limit);
+  const foundAt = digits.indexOf(query);
+  const note = probabilityNote(query, limit);
 
-  if (!info) {
-    estimateText.textContent = "-";
-    return;
-  }
-
-  if (info.mode === "dataset") {
-    const seconds = Math.max(0.4, limit / 25000000);
-    estimateText.textContent = formatSeconds(seconds);
-    return;
-  }
-
-  estimateText.textContent = "需要数据";
-}
-
-function updateStatus(message = "Ready", searchedDigits = 0) {
-  const info = constants.get(constantSelect.value);
-  statusText.textContent = message;
-  digitCount.textContent = `${formatNumber(searchedDigits)} 位`;
-  constantName.textContent = info?.label || constantSelect.value;
-  updateEstimate();
-}
-
-function rebuildLimitOptions(info) {
-  const current = Number(precisionSelect.value);
-  const limits = [20000, 50000, 100000, 200000, 500000, 1000000, 10000000, 100000000]
-    .filter((value) => value <= info.availableDigits);
-
-  precisionSelect.innerHTML = limits
-    .map((value) => `<option value="${value}">前 ${formatNumber(value)} 位</option>`)
-    .join("");
-
-  const best = limits.includes(current) ? current : limits[Math.min(1, limits.length - 1)];
-  precisionSelect.value = String(best);
-  updateEstimate();
-}
-
-async function loadConstants() {
-  const response = await fetch("/api/constants");
-  if (!response.ok) throw new Error("Failed to load constants");
-
-  const payload = await response.json();
-  constants = new Map(payload.constants.map((item) => [item.key, item]));
-
-  constantSelect.innerHTML = payload.constants
-    .map((item) => {
-      const mode = item.mode === "dataset" ? "" : " · 未安装数据";
-      return `<option value="${item.key}">${item.label} ${mode}</option>`;
-    })
-    .join("");
-
-  constantSelect.value = "pi";
-  rebuildLimitOptions(constants.get("pi"));
-  updateStatus("Ready", 0);
-}
-
-async function runSearch(query, key, limit) {
-  const startedAt = performance.now();
-  const params = new URLSearchParams({ constant: key, query, limit: String(limit) });
-  const response = await fetch(`/api/search?${params}`);
-  const payload = await response.json();
-
-  if (!response.ok) {
-    throw new Error(payload.error || "Search failed");
-  }
-
-  const elapsedSeconds = payload.elapsedMs ? payload.elapsedMs / 1000 : (performance.now() - startedAt) / 1000;
-  updateStatus(`Done in ${formatSeconds(elapsedSeconds).replace("~", "")}`, payload.searchedDigits);
-
-  const note = probabilityNote(query, payload.searchedDigits);
-  const modeText = "数据集模式";
-
-  if (!payload.found) {
+  if (foundAt === -1) {
     renderResult(
       "missing",
-      "暂时没找到",
-      `在 ${payload.constant.fullName} 的前 ${formatNumber(payload.searchedDigits)} 位小数中没有找到 ${escapeHtml(query)}。当前使用${modeText}。${note ? " " + note : ""}`
+      "\u6682\u65f6\u6ca1\u627e\u5230",
+      `\u5728 ${meta.fullName} \u7684\u524d ${formatNumber(limit)} \u4f4d\u5c0f\u6570\u4e2d\u6ca1\u6709\u627e\u5230 ${escapeHtml(query)}\u3002${note ? " " + note : ""}`
     );
     return;
   }
 
+  const start = foundAt + 1;
+  const end = foundAt + query.length;
   renderResult(
     "found",
-    `第 ${formatNumber(payload.start)} 位到第 ${formatNumber(payload.end)} 位`,
-    `${escapeHtml(query)} 第一次出现在 ${payload.constant.fullName} 的这个位置。当前使用${modeText}。${note ? " " + note : ""}`,
-    makeContextHtml(payload.context)
+    `\u7b2c ${formatNumber(start)} \u4f4d\u5230\u7b2c ${formatNumber(end)} \u4f4d`,
+    `${escapeHtml(query)} \u7b2c\u4e00\u6b21\u51fa\u73b0\u5728 ${meta.fullName} \u7684\u8fd9\u4e2a\u4f4d\u7f6e\u3002${note ? " " + note : ""}`,
+    makeContextHtml(digits, foundAt, query)
   );
 }
 
-form.addEventListener("submit", async (event) => {
+function ensureDigits(key, decimals, query) {
+  activeKey = key;
+  pendingQuery = query;
+  pendingLimit = decimals;
+
+  const existing = cache.get(key);
+  if (existing && existing.decimals >= decimals) {
+    updateStatus("Ready");
+    searchDigits(key, query, decimals);
+    return;
+  }
+
+  setBusy(true);
+  updateStatus("Preparing...");
+  startedAt = performance.now();
+  startElapsedTimer();
+
+  if (worker) worker.terminate();
+  worker = createWorker();
+
+  worker.onmessage = (event) => {
+    const { type, message, key: readyKey, decimals: readyDecimals, digits } = event.data;
+
+    if (type === "status") {
+      statusText.textContent = message;
+      return;
+    }
+
+    if (type === "done") {
+      const seconds = (performance.now() - startedAt) / 1000;
+      runtimeSamples.set(`${readyKey}:${readyDecimals}`, seconds);
+      cache.set(readyKey, { digits, decimals: readyDecimals });
+      activeKey = readyKey;
+      stopElapsedTimer();
+      setBusy(false);
+      updateStatus(`Done in ${formatSeconds(seconds).replace("~", "")}`);
+      searchDigits(readyKey, pendingQuery, pendingLimit);
+    }
+  };
+
+  worker.onerror = () => {
+    stopElapsedTimer();
+    setBusy(false);
+    updateStatus("Error");
+    renderResult(
+      "error",
+      "\u8ba1\u7b97\u5931\u8d25",
+      "\u6d4f\u89c8\u5668\u6ca1\u6709\u5b8c\u6210\u8fd9\u6b21\u8ba1\u7b97\u3002\u53ef\u4ee5\u5148\u9009\u62e9\u8f83\u5c0f\u7684\u641c\u7d22\u8303\u56f4\u518d\u8bd5\u3002"
+    );
+  };
+
+  worker.postMessage({ key, decimals });
+}
+
+form.addEventListener("submit", (event) => {
   event.preventDefault();
   const query = cleanQuery(numberInput.value);
   numberInput.value = query;
 
   if (!query) {
-    renderResult("error", "请输入数字", "可以输入生日、纪念日、手机号后几位，非数字字符会被自动忽略。");
+    renderResult(
+      "error",
+      "\u8bf7\u8f93\u5165\u6570\u5b57",
+      "\u53ef\u4ee5\u8f93\u5165\u751f\u65e5\u3001\u7eaa\u5ff5\u65e5\u3001\u624b\u673a\u53f7\u540e\u51e0\u4f4d\uff0c\u975e\u6570\u5b57\u5b57\u7b26\u4f1a\u88ab\u81ea\u52a8\u5ffd\u7565\u3002"
+    );
     return;
   }
 
-  const info = constants.get(constantSelect.value);
-  if (!info || info.mode !== "dataset") {
-    renderResult("error", "数据集未安装", "正式版需要先在服务器上安装对应常数的数据分块，例如 data/pi/manifest.json 和 chunk 文件。");
-    return;
-  }
-
-  setBusy(true);
-  updateStatus("Searching...", 0);
-
-  try {
-    await runSearch(query, constantSelect.value, Number(precisionSelect.value));
-  } catch (error) {
-    updateStatus("Error", 0);
-    renderResult("error", "搜索失败", error.message || "后端没有完成这次查询。");
-  } finally {
-    setBusy(false);
-  }
+  ensureDigits(constantSelect.value, Number(precisionSelect.value), query);
 });
 
 numberInput.addEventListener("input", () => {
@@ -208,19 +341,12 @@ numberInput.addEventListener("input", () => {
 });
 
 constantSelect.addEventListener("change", () => {
-  rebuildLimitOptions(constants.get(constantSelect.value));
-  updateStatus("Ready", 0);
+  activeKey = constantSelect.value;
+  updateStatus("Ready");
 });
 
 precisionSelect.addEventListener("change", updateEstimate);
-
-loadConstants().catch((error) => {
-  renderResult(
-    "error",
-    "后端未连接",
-    `${error.message}。请用 npm start 启动动态网站，然后访问 http://localhost:8000。`
-  );
-});
+updateStatus("Ready");
 
 const canvas = document.querySelector("#field");
 const ctx = canvas.getContext("2d");
